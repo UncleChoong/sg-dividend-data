@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List
 
+from sg_dividend_data.enrichment import enrich_entry
 from sg_dividend_data.models import TickerSnapshot, UniverseEntry
 from sg_dividend_data.scoring import score
 
@@ -17,7 +18,11 @@ def assemble(snapshots: List[TickerSnapshot]) -> dict:
     for snap in snapshots:
         sb = score(snap)
         entry = UniverseEntry.from_snapshot(snap, sb)
-        entries.append(entry.model_dump())
+        entry_dict = entry.model_dump()
+        if snap.market_cap and snap.market_cap > 0:
+            entry_dict["market_cap_sgd"] = snap.market_cap
+        enrich_entry(entry_dict)
+        entries.append(entry_dict)
     return {
         "generated_at": datetime.now(SGT).isoformat(),
         "schema_version": SCHEMA_VERSION,
