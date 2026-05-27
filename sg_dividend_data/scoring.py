@@ -34,23 +34,15 @@ def mcap_points(market_cap: Optional[float]) -> int:
 
 
 def div_vol_points(history: List[Optional[float]]) -> int:
+    """Score dividend volatility risk.  history is most-recent-FY-first.
+    A "cut" is history[i] < history[i+1]: the more-recent payment is lower.
+    """
     non_null = [h for h in history if h is not None]
     if not non_null:
         return 10
 
-    # Check if array is strictly ascending (safe, no penalty for strictly rising)
-    is_ascending = True
-    for i in range(len(non_null) - 1):
-        if non_null[i] >= non_null[i+1]:
-            is_ascending = False
-            break
-    if is_ascending:
-        if len(non_null) < len(history):
-            return 10  # Missing data despite ascending
-        else:
-            return 0  # Complete and ascending
-
-    # Not ascending: penalize for cuts and volatility
+    # Count dividend cuts: history[i] < history[i+1] means the current year's
+    # dividend is lower than the previous year's (most-recent-first convention).
     pts = 0
     for i in range(len(history) - 1):
         cur = history[i]

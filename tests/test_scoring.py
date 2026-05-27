@@ -25,9 +25,16 @@ def test_mcap_small_cap_penalty():
 def test_div_vol_no_cuts():
     assert div_vol_points([1.0, 1.0, 1.0, 1.0, 1.0]) == 0
 
+def test_div_vol_rising_no_cut():
+    # Most-recent-first: [1.4, 1.3, 1.2, 1.1, 1.0] means dividends rose every year — 0 cuts.
+    assert div_vol_points([1.4, 1.3, 1.2, 1.1, 1.0]) == 0
+
+def test_div_vol_four_cuts():
+    # Most-recent-first: [1.0, 1.1, 1.2, 1.3, 1.4] — dividends fell every year, 4 cuts → 40pts capped at 25.
+    assert div_vol_points([1.0, 1.1, 1.2, 1.3, 1.4]) == 25
+
 def test_div_vol_one_cut():
-    assert div_vol_points([1.0, 1.1, 1.2, 1.3, 1.4]) == 0  # rising, no cut
-    assert div_vol_points([0.5, 1.0, 1.0, 1.0, 1.0]) == 10  # most-recent < next-most-recent
+    assert div_vol_points([0.5, 1.0, 1.0, 1.0, 1.0]) == 10  # most-recent < next-most-recent: 1 cut
 
 def test_div_vol_missing_history():
     assert div_vol_points([None, None, None, None, None]) == 10
