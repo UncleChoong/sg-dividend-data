@@ -33,7 +33,12 @@ def _compute_price_vol_90d(ticker: str, *, session=None) -> Optional[float]:
 
 def build_snapshot(ticker: str, *, session: Optional[requests.Session] = None) -> TickerSnapshot:
     yq = fetch_quote(ticker, session=session)
-    hist = fetch_div_history(ticker, session=session)
+    # Attempt div history but gracefully degrade if it fails (SGinvestors often 403s)
+    hist = []
+    try:
+        hist = fetch_div_history(ticker, session=session)
+    except Exception as e:
+        log.warning("div history fetch failed for %s: %s (using empty history)", ticker, e)
     name = ticker
     return TickerSnapshot(
         ticker=ticker,
