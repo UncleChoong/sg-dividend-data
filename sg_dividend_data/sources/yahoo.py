@@ -1,14 +1,13 @@
-"""Scrape Yahoo Finance quote page for an SGX ticker."""
+"""Fetch SGX quote data via yfinance (Yahoo Finance JSON API)."""
 from __future__ import annotations
-import json
-import re
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
-import requests
-from bs4 import BeautifulSoup
+import pandas as pd
+import yfinance as yf
 
-UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,137 +18,93 @@ class YahooQuote:
     beta: Optional[float]
 
 
-def fetch_quote(ticker: str, *, session: Optional[requests.Session] = None) -> YahooQuote:
-    s = session or requests.Session()
-    url = f"https://finance.yahoo.com/quote/{ticker}.SI/"
-    r = s.get(url, headers=UA, timeout=15)
-    r.raise_for_status()
-    return parse_quote_html(r.text)
+def fetch_quote(ticker: str) -> YahooQuote:
+    """Fetch price, market-cap, TTM yield and beta for an SGX ticker.
 
+    Args:
+        ticker: bare SGX code, e.g. "D05".  The ".SI" suffix is added internally.
 
-def parse_quote_html(html: str) -> YahooQuote:
-    # Strategy 1: __NEXT_DATA__ JSON (older Yahoo Finance format)
-    soup = BeautifulSoup(html, "html.parser")
-    next_data = soup.find("script", id="__NEXT_DATA__")
-    if next_data and next_data.string:
+    Returns:
+        YahooQuote dataclass.
+
+    Raises:
+        ValueError: if price cannot be determined (ticker not found / delisted).
+    """
+    symbol = f"{ticker}.SI"
+    try:
+        t = yf.Ticker(symbol)
+        fi = t.fast_info
+
+        # price — required
+        price = fi.last_price
+        if price is None or price <= 0:
+            raise ValueError(f"yfinance: no price for {symbol}")
+
+        # market cap — optional
         try:
-            data = json.loads(next_data.string)
-            return _from_next_data(data)
-        except (ValueError, KeyError):
+            mcap: Optional[float] = float(fi["marketCap"]) if fi["marketCap"] else None
+        except Exception:
+            mcap = None
+
+        # TTM yield — try trailingAnnualDividendYield (fraction) then dividendYield (may be %)
+        # then fall back to computing from dividends series / price.
+        ttm_yield_pct: Optional[float] = _resolve_yield(t, price)
+
+        # beta — optional
+        beta: Optional[float] = None
+        try:
+            raw_beta = t.info.get("beta")
+            if raw_beta is not None:
+                beta = float(raw_beta)
+        except Exception:
             pass
 
-    # Strategy 2: regex sniff visible price + yield from page text.
-    # Yahoo Finance embeds data in two forms:
-    #   a) plain JSON:   "regularMarketPrice":{"raw":62.18,...}
-    #   b) escaped JSON: \"regularMarketPrice\":{\"raw\":62.18,...}  (inside a JS string)
-    price = _find_price(html)
-    yield_pct = _find_yield(html)
-    mcap = _find_market_cap(html)
-    beta = _find_beta(html, soup)
-    if price is None:
-        raise ValueError("yahoo: could not parse price")
-    return YahooQuote(price=price, market_cap=mcap, ttm_yield_pct=yield_pct, beta=beta)
+        return YahooQuote(
+            price=float(price),
+            market_cap=mcap,
+            ttm_yield_pct=ttm_yield_pct,
+            beta=beta,
+        )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"yfinance: failed to fetch {symbol}: {exc}") from exc
 
 
-def _from_next_data(data: dict) -> YahooQuote:
-    def find(node, key):
-        if isinstance(node, dict):
-            if key in node and isinstance(node[key], (int, float)):
-                return node[key]
-            for v in node.values():
-                r = find(v, key)
-                if r is not None:
-                    return r
-        elif isinstance(node, list):
-            for v in node:
-                r = find(v, key)
-                if r is not None:
-                    return r
-        return None
+def _resolve_yield(t: yf.Ticker, price: float) -> Optional[float]:
+    """Return TTM yield as a percentage (e.g. 5.0 for 5%), or None."""
+    # 1. trailingAnnualDividendYield — Yahoo stores this as a fraction (0.05 = 5%)
+    try:
+        info = t.info
+        tay = info.get("trailingAnnualDividendYield")
+        if tay and float(tay) > 0:
+            pct = float(tay) * 100
+            # Sanity check: yfinance occasionally stores it already as a percent
+            if pct > 50:
+                pct = float(tay)  # it was already a percent
+            return round(pct, 4)
+    except Exception:
+        pass
 
-    price = find(data, "regularMarketPrice")
-    mcap = find(data, "marketCap")
-    yld = find(data, "trailingAnnualDividendYield")
-    beta = find(data, "beta")
-    if price is None:
-        raise ValueError("yahoo: regularMarketPrice missing from __NEXT_DATA__")
-    return YahooQuote(
-        price=float(price),
-        market_cap=float(mcap) if mcap else None,
-        ttm_yield_pct=float(yld) * 100 if yld and yld < 1 else (float(yld) if yld else None),
-        beta=float(beta) if beta else None,
-    )
+    # 2. dividendYield — Yahoo sometimes stores this already as a percent (e.g. 3.6 means 3.6%)
+    try:
+        dy = info.get("dividendYield")
+        if dy and float(dy) > 0:
+            # If value > 1 it's already a percent; if <= 1 it's a fraction
+            dy_f = float(dy)
+            return round(dy_f if dy_f > 1 else dy_f * 100, 4)
+    except Exception:
+        pass
 
+    # 3. Compute TTM yield from dividend history
+    try:
+        divs = t.dividends
+        if divs is not None and len(divs) > 0:
+            cutoff = pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=1)
+            ttm_total = divs[divs.index >= cutoff].sum()
+            if ttm_total > 0 and price > 0:
+                return round(ttm_total / price * 100, 4)
+    except Exception:
+        pass
 
-# ---------------------------------------------------------------------------
-# Regex helpers — handle both plain and JS-escaped JSON forms.
-# Current Yahoo Finance (2026) embeds the main-ticker data as a doubly-escaped
-# JS string: \\"key\\":{\\"raw\\":VALUE.  Sidebar / watchlist data appears
-# earlier in the page as plain JSON: "key":{"raw":VALUE.
-# We prefer the escaped form so we always read the page's primary ticker.
-# ---------------------------------------------------------------------------
-
-def _raw_pattern_escaped(key: str, value_pat: str = r"[-0-9.E+]+") -> str:
-    """Match escaped JSON form: \\"key\\":{\\"raw\\":VALUE (JS string embeds)."""
-    escaped_key = re.escape(key)
-    return r'\\"' + escaped_key + r'\\":\{\\"raw\\":(' + value_pat + r")"
-
-
-def _raw_pattern_plain(key: str, value_pat: str = r"[-0-9.E+]+") -> str:
-    """Match plain JSON form: \"key\":{\"raw\":VALUE."""
-    escaped_key = re.escape(key)
-    return r'"' + escaped_key + r'":\{"raw":(' + value_pat + r")"
-
-
-def _find_raw(html: str, key: str, value_pat: str = r"[0-9.E+]+") -> Optional[str]:
-    """Return the first raw value for *key*, preferring the escaped JSON form
-    (which is the main-ticker data block in the current Yahoo Finance layout)
-    over the plain JSON form (which may appear in sidebar/watchlist blocks first)."""
-    m = re.search(_raw_pattern_escaped(key, value_pat), html)
-    if m:
-        return m.group(1)
-    m = re.search(_raw_pattern_plain(key, value_pat), html)
-    return m.group(1) if m else None
-
-
-def _find_price(html: str) -> Optional[float]:
-    v = _find_raw(html, "regularMarketPrice", r"[0-9.]+")
-    if v is not None:
-        return float(v)
-    # Fallback: bare scalar (some API responses)
-    m = re.search(r'"regularMarketPrice":\s*([0-9.]+)', html)
-    return float(m.group(1)) if m else None
-
-
-def _find_yield(html: str) -> Optional[float]:
-    v = _find_raw(html, "trailingAnnualDividendYield", r"[0-9.E+]+")
-    if v is not None:
-        val = float(v)
-        return val * 100 if val < 1 else val
-    return None
-
-
-def _find_market_cap(html: str) -> Optional[float]:
-    v = _find_raw(html, "marketCap", r"[0-9.E+]+")
-    return float(v) if v is not None else None
-
-
-def _find_beta(html: str, soup: Optional[BeautifulSoup] = None) -> Optional[float]:
-    # Try escaped/plain JSON first
-    v = _find_raw(html, "beta", r"-?[0-9.]+")
-    if v is not None:
-        return float(v)
-    # Newer Yahoo Finance renders beta in an HTML table as a visible span
-    # <span class="label ...">Beta (5Y Monthly)</span> <span class="value ...">0.27</span>
-    if soup is None:
-        soup = BeautifulSoup(html, "html.parser")
-    for label_span in soup.find_all("span", title=re.compile(r"Beta", re.I)):
-        parent = label_span.find_parent()
-        if parent:
-            value_span = parent.find("span", class_=re.compile(r"value"))
-            if value_span:
-                try:
-                    return float(value_span.get_text(strip=True))
-                except ValueError:
-                    pass
     return None

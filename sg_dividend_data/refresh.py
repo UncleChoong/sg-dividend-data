@@ -7,11 +7,9 @@ import traceback
 from pathlib import Path
 from typing import List, Optional
 
-import requests
-
 from sg_dividend_data.alerts import telegram_alert
 from sg_dividend_data.models import TickerSnapshot
-from sg_dividend_data.sources.sginvestors import fetch_div_history
+from sg_dividend_data.sources.dividend_history import fetch_div_history
 from sg_dividend_data.sources.yahoo import fetch_quote
 from sg_dividend_data.universe import SECTOR_MAP, SGX_DIVIDEND_TICKERS, lot_size_for
 from sg_dividend_data.uploader import upload_to_r2
@@ -31,17 +29,16 @@ def _compute_payout_ratio(history: list, snapshot=None) -> Optional[float]:
     return None
 
 
-def _compute_price_vol_90d(ticker: str, *, session=None) -> Optional[float]:
+def _compute_price_vol_90d(ticker: str) -> Optional[float]:
     # MVP: stub. TODO(v2): implement via Yahoo chart endpoint.
     return None
 
 
-def build_snapshot(ticker: str, *, session: Optional[requests.Session] = None) -> TickerSnapshot:
-    yq = fetch_quote(ticker, session=session)
-    # Attempt div history but gracefully degrade if it fails (SGinvestors often 403s)
-    hist = []
+def build_snapshot(ticker: str) -> TickerSnapshot:
+    yq = fetch_quote(ticker)
+    hist: list = []
     try:
-        hist = fetch_div_history(ticker, session=session)
+        hist = fetch_div_history(ticker)
     except Exception as e:
         log.warning("div history fetch failed for %s: %s (using empty history)", ticker, e)
     name = ticker
@@ -55,17 +52,16 @@ def build_snapshot(ticker: str, *, session: Optional[requests.Session] = None) -
         lot_size=lot_size_for(ticker),
         div_history_5y=hist,
         payout_ratio=_compute_payout_ratio(hist),
-        price_vol_90d=_compute_price_vol_90d(ticker, session=session),
+        price_vol_90d=_compute_price_vol_90d(ticker),
     )
 
 
 def refresh_all(*, dry_run: bool, output: Path) -> List[TickerSnapshot]:
-    session = requests.Session()
     snapshots: list[TickerSnapshot] = []
     failures: list[str] = []
     for t in SGX_DIVIDEND_TICKERS:
         try:
-            snap = build_snapshot(t, session=session)
+            snap = build_snapshot(t)
             snapshots.append(snap)
             log.info("ok %s price=%.2f yield=%.2f%%", t, snap.price, snap.ttm_yield_pct)
         except Exception as exc:

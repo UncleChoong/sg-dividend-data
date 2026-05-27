@@ -1,14 +1,12 @@
-from unittest.mock import patch, MagicMock
 from sg_dividend_data.refresh import build_snapshot
 from sg_dividend_data.sources.yahoo import YahooQuote
-from pathlib import Path
 
 
 def test_build_snapshot_assembles_fields(monkeypatch):
     yq = YahooQuote(price=42.0, market_cap=1e11, ttm_yield_pct=5.0, beta=1.0)
-    monkeypatch.setattr("sg_dividend_data.refresh.fetch_quote", lambda t, session=None: yq)
+    monkeypatch.setattr("sg_dividend_data.refresh.fetch_quote", lambda t: yq)
     monkeypatch.setattr("sg_dividend_data.refresh.fetch_div_history",
-                        lambda t, session=None: [1.9, 1.6, 1.4, 1.2, 1.2])
+                        lambda t: [1.9, 1.6, 1.4, 1.2, 1.2])
     monkeypatch.setattr("sg_dividend_data.refresh._compute_payout_ratio", lambda *a, **k: 0.5)
     monkeypatch.setattr("sg_dividend_data.refresh._compute_price_vol_90d", lambda *a, **k: 0.18)
 
@@ -25,7 +23,7 @@ def test_refresh_skips_upload_when_no_snapshots(monkeypatch, tmp_path):
 
     # Force every ticker fetch to fail.
     monkeypatch.setattr(r, "build_snapshot",
-        lambda t, session=None: (_ for _ in ()).throw(RuntimeError("boom")))
+        lambda t: (_ for _ in ()).throw(RuntimeError("boom")))
 
     # Spy on uploader — it must NOT be called.
     called = {"n": 0}

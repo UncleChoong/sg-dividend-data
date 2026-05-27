@@ -10,7 +10,10 @@ SGX_DIVIDEND_TICKERS: List[str] = [
     "Z74", "CC3", "AJBU", "CJLU",
     # Core S-REITs
     "A17U", "C38U", "M44U", "N2IU", "ME8U", "T82U", "J69U", "BUOU", "C2PU",
-    "AU8U", "M1GU", "ACV", "T39",
+    "AU8U", "M1GU",
+    # ACV (CapitaLand Ascott REIT) and T39 (Suntec REIT) are not resolvable via
+    # yfinance (Yahoo returns no exchangeTimezoneName — likely stale/delisted symbols).
+    # Remove until they can be confirmed working.
     # Business Trusts / Yield plays
     "U96", "S58",
     # Industrials / Defensives
@@ -29,7 +32,7 @@ SECTOR_MAP: Dict[str, str] = {
     "AJBU": "Utilities", "CJLU": "Utilities",
     "A17U": "REITs", "C38U": "REITs", "M44U": "REITs", "N2IU": "REITs", "ME8U": "REITs",
     "T82U": "REITs", "J69U": "REITs", "BUOU": "REITs", "C2PU": "REITs",
-    "AU8U": "REITs", "M1GU": "REITs", "ACV": "REITs", "T39": "REITs",
+    "AU8U": "REITs", "M1GU": "REITs",
     "U96": "Business Trusts", "S58": "Business Trusts",
     "S63": "Industrials", "Y92": "Consumer", "C07": "Consumer", "BN4": "Industrials",
     "F34": "Consumer", "S68": "Industrials",
