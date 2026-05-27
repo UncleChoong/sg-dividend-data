@@ -19,6 +19,11 @@ from sg_dividend_data.writer import write_universe
 
 log = logging.getLogger("refresh")
 
+# Refuse to publish to R2 if fewer than this many tickers scraped successfully.
+# Protects against overwriting a good R2 file with a near-empty one when most
+# scrapers fail (e.g. during a network outage or anti-bot block wave).
+MIN_TICKERS_FOR_PUBLISH = 5
+
 
 def _compute_payout_ratio(history: list, snapshot=None) -> Optional[float]:
     # MVP: we don't have EPS scraping yet; return None → scoring uses fallback.
@@ -67,10 +72,19 @@ def refresh_all(*, dry_run: bool, output: Path) -> List[TickerSnapshot]:
             log.exception("fail %s: %s", t, exc)
             failures.append(f"{t}: {exc}")
     write_universe(snapshots, output)
-    if not dry_run:
-        upload_to_r2(output)
     if failures:
         telegram_alert(f"SG dividend refresh: {len(failures)} failures\n" + "\n".join(failures[:20]))
+    if not dry_run:
+        if len(snapshots) < MIN_TICKERS_FOR_PUBLISH:
+            msg = (
+                f"SG dividend refresh: only {len(snapshots)} tickers succeeded "
+                f"(minimum {MIN_TICKERS_FOR_PUBLISH}), NOT uploading to R2. "
+                f"{len(failures)} failures."
+            )
+            telegram_alert(msg + "\n" + "\n".join(failures[:20]))
+            log.error(msg)
+            return snapshots
+        upload_to_r2(output)
     return snapshots
 
 

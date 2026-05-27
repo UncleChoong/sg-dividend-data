@@ -1,6 +1,7 @@
 from unittest.mock import patch, MagicMock
 from sg_dividend_data.refresh import build_snapshot
 from sg_dividend_data.sources.yahoo import YahooQuote
+from pathlib import Path
 
 
 def test_build_snapshot_assembles_fields(monkeypatch):
@@ -17,3 +18,23 @@ def test_build_snapshot_assembles_fields(monkeypatch):
     assert snap.price == 42.0
     assert snap.ttm_yield_pct == 5.0
     assert snap.div_history_5y == [1.9, 1.6, 1.4, 1.2, 1.2]
+
+
+def test_refresh_skips_upload_when_no_snapshots(monkeypatch, tmp_path):
+    from sg_dividend_data import refresh as r
+
+    # Force every ticker fetch to fail.
+    monkeypatch.setattr(r, "build_snapshot",
+        lambda t, session=None: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    # Spy on uploader — it must NOT be called.
+    called = {"n": 0}
+    monkeypatch.setattr(r, "upload_to_r2",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(r, "telegram_alert", lambda *a, **k: True)
+
+    output = tmp_path / "x.json"
+    snaps = r.refresh_all(dry_run=False, output=output)
+
+    assert snaps == []
+    assert called["n"] == 0, "should NOT have uploaded an empty universe"
