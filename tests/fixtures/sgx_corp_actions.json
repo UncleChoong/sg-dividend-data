@@ -1,0 +1,8 @@
+{
+  "data": [
+    {"stock-code": "D05", "name": "DBS Group", "ex-date": "2027-04-12",
+     "payment-date": "2027-05-10", "rate": "0.60"},
+    {"stock-code": "O39", "name": "OCBC", "ex-date": "2027-04-15",
+     "payment-date": "2027-05-12", "rate": "0.45"}
+  ]
+}
