@@ -33,6 +33,18 @@ MIN_TICKERS_FOR_PUBLISH = 5
 # that has effectively stopped paying — out of scope for a dividend app.
 MIN_DIVIDEND_YIELD_PCT = 0.5
 
+# Currencies accepted in the published universe. SGX-listed names that trade
+# in USD/EUR/GBP (Jardine Matheson J36, Hongkong Land H78, Cromwell European
+# Q5T, Elite UK MENU, etc.) get filtered out — displaying their USD prices
+# with an "S$" prefix would mislead users running dividend simulations.
+ACCEPTED_CURRENCIES = {"SGD", None}
+
+# Tickers with no dividend payment in the last N days are filtered out.
+# Catches zombie payers — companies that yfinance still reports a
+# dividendYield for despite having actually stopped paying years ago
+# (e.g. AWK Fuxing China Group last paid in 2011).
+MAX_DAYS_SINCE_LAST_DIVIDEND = 730  # 2 years
+
 
 def _compute_payout_ratio(history: list, snapshot=None) -> Optional[float]:
     return None
@@ -75,7 +87,32 @@ def build_snapshot(ticker: str, *, sgx_sector_hint: Optional[str] = None) -> Tic
         yf_sector=yq.yf_sector,
         yf_industry=yq.yf_industry,
         yf_summary=yq.long_business_summary,
+        currency=yq.currency,
+        last_dividend_date=yq.last_dividend_date,
     )
+
+
+def _is_zombie_payer(snap: TickerSnapshot) -> bool:
+    """True if the most-recent dividend payment is older than the cutoff.
+
+    Catches AWK-style entries where Yahoo still reports a dividendYield
+    but the underlying company stopped paying years ago.
+    """
+    import datetime
+    if not snap.last_dividend_date:
+        # No dividend history at all — yield can only come from Yahoo's
+        # info fields which we've already learned are unreliable for
+        # zombie payers. Treat as zombie unless yfinance gave us a
+        # current yield AND the ticker has zero recorded payments
+        # (likely a new listing — let it through, the bundled history
+        # will simply be empty and the user sees that).
+        return False
+    try:
+        last = datetime.date.fromisoformat(snap.last_dividend_date)
+        age_days = (datetime.date.today() - last).days
+        return age_days > MAX_DAYS_SINCE_LAST_DIVIDEND
+    except Exception:
+        return False
 
 
 def _explicit_sector_overrides() -> set[str]:
@@ -137,22 +174,38 @@ def refresh_all(
     snapshots: list[TickerSnapshot] = []
     failures: list[str] = []
     skipped_low_yield: list[str] = []
+    skipped_currency: list[str] = []
+    skipped_zombie: list[str] = []
     candidates = _build_candidate_universe(auto_discover=auto_discover)
     for t, hint in candidates:
         try:
             snap = build_snapshot(t, sgx_sector_hint=hint)
+            if snap.currency not in ACCEPTED_CURRENCIES:
+                skipped_currency.append(f"{t} ({snap.currency})")
+                continue
             if snap.ttm_yield_pct < MIN_DIVIDEND_YIELD_PCT:
                 skipped_low_yield.append(f"{t} ({snap.ttm_yield_pct:.2f}%)")
                 continue
+            if _is_zombie_payer(snap):
+                skipped_zombie.append(f"{t} (last_div={snap.last_dividend_date})")
+                continue
             snapshots.append(snap)
-            log.info("ok %s price=%.2f yield=%.2f%%", t, snap.price, snap.ttm_yield_pct)
+            log.info(
+                "ok %s ccy=%s price=%.2f yield=%.2f%%",
+                t, snap.currency or "?", snap.price, snap.ttm_yield_pct,
+            )
         except Exception as exc:
             log.warning("fail %s: %s", t, exc)
             failures.append(f"{t}: {exc}")
     log.info(
-        "kept=%d failed=%d skipped_low_yield=%d",
+        "kept=%d failed=%d skipped_low_yield=%d skipped_currency=%d skipped_zombie=%d",
         len(snapshots), len(failures), len(skipped_low_yield),
+        len(skipped_currency), len(skipped_zombie),
     )
+    if skipped_currency:
+        log.info("non-SGD tickers filtered: %s", ", ".join(skipped_currency[:20]))
+    if skipped_zombie:
+        log.info("zombie payers filtered: %s", ", ".join(skipped_zombie[:20]))
     write_universe(snapshots, output)
     if failures and not dry_run:
         telegram_alert(

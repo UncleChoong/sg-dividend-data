@@ -22,6 +22,17 @@ class YahooQuote:
     yf_sector: Optional[str] = None
     yf_industry: Optional[str] = None
     long_business_summary: Optional[str] = None
+    # Trading currency reported by yfinance (e.g. "SGD", "USD"). Critical
+    # for sg-dividend-data because a number of SGX-listed names (Jardine
+    # Matheson J36, Hongkong Land H78, etc.) trade in USD — treating their
+    # SGD-prefixed prices/market-caps as such is a real bug, not a label
+    # nit. The refresh pipeline filters non-SGD names out of the universe.
+    currency: Optional[str] = None
+    # Date (ISO YYYY-MM-DD) of the most recent dividend payment, if any.
+    # Used to filter out "zombie payers" — companies that yfinance still
+    # reports a historical dividendYield for, but which actually stopped
+    # paying years ago (e.g. AWK Fuxing China, last paid 2011).
+    last_dividend_date: Optional[str] = None
 
 
 def fetch_quote(ticker: str) -> YahooQuote:
@@ -86,6 +97,21 @@ def fetch_quote(ticker: str) -> YahooQuote:
         if isinstance(summary, str):
             summary = summary.strip() or None
 
+        currency = info.get("currency")
+        if isinstance(currency, str):
+            currency = currency.strip().upper() or None
+        else:
+            currency = None
+
+        last_dividend_date: Optional[str] = None
+        try:
+            divs = t.dividends
+            if divs is not None and len(divs) > 0:
+                last = divs.index.max()
+                last_dividend_date = last.date().isoformat()
+        except Exception:
+            pass
+
         return YahooQuote(
             price=float(price),
             market_cap=mcap,
@@ -95,6 +121,8 @@ def fetch_quote(ticker: str) -> YahooQuote:
             yf_sector=yf_sector,
             yf_industry=yf_industry,
             long_business_summary=summary,
+            currency=currency,
+            last_dividend_date=last_dividend_date,
         )
     except ValueError:
         raise

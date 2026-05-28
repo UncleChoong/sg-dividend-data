@@ -21,6 +21,8 @@ class TickerSnapshot(BaseModel):
     yf_sector: Optional[str] = None
     yf_industry: Optional[str] = None
     yf_summary: Optional[str] = None
+    currency: Optional[str] = None
+    last_dividend_date: Optional[str] = None
 
 
 class ScoreBreakdown(BaseModel):
