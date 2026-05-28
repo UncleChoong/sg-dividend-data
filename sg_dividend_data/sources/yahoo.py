@@ -102,37 +102,59 @@ def fetch_quote(ticker: str) -> YahooQuote:
         raise ValueError(f"yfinance: failed to fetch {symbol}: {exc}") from exc
 
 
+# Anything above this is almost certainly bad data — Yahoo's
+# trailingAnnualDividendYield / dividendYield fields occasionally return
+# values inflated by special / liquidation dividends, broken split
+# adjustments, or stale numerator-over-fresh-denominator bugs. SGX dividend
+# yields realistically top out around 12-15% even for the highest-yielders.
+MAX_PLAUSIBLE_YIELD_PCT = 20.0
+
+
 def _resolve_yield(t: yf.Ticker, price: float, info: dict) -> Optional[float]:
-    """Return TTM yield as a percentage (e.g. 5.0 for 5%), or None."""
-    # 1. trailingAnnualDividendYield — Yahoo stores this as a fraction (0.05 = 5%)
+    """Return TTM yield as a percentage (e.g. 5.0 for 5%), or None.
+
+    Order of preference, from most-reliable to least:
+      1. Sum of the last 12 months of dividends from `t.dividends` ÷ price.
+      2. trailingAnnualDividendYield from the info dict.
+      3. dividendYield from the info dict.
+
+    Any candidate exceeding MAX_PLAUSIBLE_YIELD_PCT is discarded as bad
+    data — for example, C05 Chemical Industries shows 90% from Yahoo's
+    info dict despite the actual dividend history giving ~3%.
+    """
+    # 1. Compute TTM yield from the actual dividend series — authoritative.
     try:
-        tay = info.get("trailingAnnualDividendYield")
-        if tay and float(tay) > 0:
-            pct = float(tay) * 100
-            # Sanity check: yfinance occasionally stores it already as a percent
-            if pct > 50:
-                pct = float(tay)
-            return round(pct, 4)
+        divs = t.dividends
+        if divs is not None and len(divs) > 0 and price > 0:
+            cutoff = pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=1)
+            ttm_total = float(divs[divs.index >= cutoff].sum())
+            if ttm_total > 0:
+                pct = ttm_total / price * 100
+                if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT:
+                    return round(pct, 4)
     except Exception:
         pass
 
-    # 2. dividendYield — Yahoo sometimes stores this already as a percent
+    # 2. trailingAnnualDividendYield — Yahoo stores this as a fraction (0.05 = 5%),
+    #    but occasionally as a raw percent. Treat anything > 1 as already-percent.
+    try:
+        tay = info.get("trailingAnnualDividendYield")
+        if tay and float(tay) > 0:
+            tay_f = float(tay)
+            pct = tay_f if tay_f > 1 else tay_f * 100
+            if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT:
+                return round(pct, 4)
+    except Exception:
+        pass
+
+    # 3. dividendYield — same fraction-vs-percent ambiguity as above.
     try:
         dy = info.get("dividendYield")
         if dy and float(dy) > 0:
             dy_f = float(dy)
-            return round(dy_f if dy_f > 1 else dy_f * 100, 4)
-    except Exception:
-        pass
-
-    # 3. Compute TTM yield from dividend history
-    try:
-        divs = t.dividends
-        if divs is not None and len(divs) > 0:
-            cutoff = pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=1)
-            ttm_total = divs[divs.index >= cutoff].sum()
-            if ttm_total > 0 and price > 0:
-                return round(ttm_total / price * 100, 4)
+            pct = dy_f if dy_f > 1 else dy_f * 100
+            if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT:
+                return round(pct, 4)
     except Exception:
         pass
 
