@@ -145,18 +145,33 @@ def _fy_based_yield_pct(
     *,
     today: Optional[datetime.date] = None,
 ) -> Optional[float]:
-    """Compute yield using the current-fiscal-year-first rule.
+    """Annualised current-FY yield with prior-year cadence scaling.
 
-    1. Sum of dividends paid in the current calendar year (FY) ÷ price.
-       If non-zero, that's the yield.
-    2. Otherwise, sum of dividends paid in the prior calendar year ÷ price.
-    3. Otherwise, return None — the caller drops the ticker.
+    Rule:
+      A. If dividends paid in the current calendar year > 0:
+         Scale that partial-year sum to a full-year estimate using FY-1's
+         payment cadence:
 
-    This matches the user-facing model: rank stocks by what they're
-    actually paying right now, falling back only when this year's payout
-    hasn't started. Eliminates two systemic problems:
-      - TTM yield is inflated when a recent special dividend lands.
-      - Multi-year-old payouts inflate the yield for zombie payers.
+             annualised = FY_current_paid * (FY_prior_full / FY_prior_paid_by_same_date)
+
+         If FY-1 had a payment by the same calendar date this year does,
+         the scale factor reflects the actual cadence (1.0 for full payers,
+         4.0 for quarterly with one payment in, 2.0 for semi-annual, etc.).
+         If FY-1 had no payment by the same date but had a full-year sum,
+         we fall through to case B rather than try to extrapolate blindly.
+
+      B. Else if FY-1 total > 0:
+         annualised = FY_prior_total (last full year is the benchmark).
+
+      C. Else return None — the caller drops the ticker.
+
+    Any candidate exceeding MAX_PLAUSIBLE_YIELD_PCT is discarded.
+
+    This eliminates two systemic problems:
+      - TTM yield inflated by recent special dividends (e.g. TCU's
+        partial-year special is no longer projected as a full-year rate).
+      - Stocks like DBS appearing to have cut their yield in half just
+        because we're mid-year and only one quarter has paid out.
     """
     if price <= 0:
         return None
@@ -167,13 +182,49 @@ def _fy_based_yield_pct(
         divs = t.dividends
         if divs is None or len(divs) == 0:
             return None
-        # yfinance's dividend index is timezone-aware Timestamps; .year works.
-        years = divs.index.year
-        current_total = float(divs[years == cy_current].sum())
-        if current_total > 0:
-            pct = current_total / price * 100
-            return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
+        # yfinance's dividend index is tz-aware Timestamps; .year / .month / .day work.
+        idx = divs.index
+        years = idx.year
+        cur_paid = float(divs[years == cy_current].sum())
         prior_total = float(divs[years == cy_prior].sum())
+
+        if cur_paid > 0:
+            # FY-1 dividends paid by the same month/day as today, last year.
+            prior_by_today = float(divs[
+                (years == cy_prior)
+                & (
+                    (idx.month < today.month)
+                    | ((idx.month == today.month) & (idx.day <= today.day))
+                )
+            ].sum())
+            if prior_by_today > 0 and prior_total > 0:
+                # Run-rate scale: how much MORE did FY-1 pay after this date?
+                scale = prior_total / prior_by_today
+                # Sanity-cap the multiplier. A scale > 5 would imply the
+                # current FY's only payment is a tiny interim and the bulk
+                # comes much later — better to fall through to FY-1 total
+                # than over-project.
+                if scale > 5.0:
+                    annualised = prior_total
+                else:
+                    annualised = cur_paid * scale
+            else:
+                # No FY-1 payment by the same date → don't extrapolate from a
+                # zero baseline. Use FY-1 total if available, else FY-current paid as-is.
+                annualised = prior_total if prior_total > 0 else cur_paid
+
+            # Growth-rate ceiling: dividends rarely grow >50% YoY. If our
+            # extrapolation implies that, the FY-current "paid so far" almost
+            # certainly contains a one-off / special dividend (TCU's $0.09
+            # extraordinary payout in May 2026 is the canonical case) and
+            # annualising it would mislead simulation users. Fall back to
+            # FY-1 total as a more sustainable estimate.
+            if prior_total > 0 and annualised > 1.5 * prior_total:
+                annualised = prior_total
+
+            pct = annualised / price * 100
+            return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
+
         if prior_total > 0:
             pct = prior_total / price * 100
             return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
