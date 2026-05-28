@@ -21,6 +21,13 @@ def assemble(snapshots: List[TickerSnapshot]) -> dict:
         entry_dict = entry.model_dump()
         if snap.market_cap and snap.market_cap > 0:
             entry_dict["market_cap_sgd"] = snap.market_cap
+        # Stash yfinance-derived metadata under `_yf_*` keys so enrich_entry
+        # can use them as a fallback when there's no curated entry. The
+        # underscore prefix signals "consumed/popped by enrichment".
+        if snap.yf_summary:
+            entry_dict["_yf_summary"] = snap.yf_summary
+        if snap.yf_industry:
+            entry_dict["_yf_industry"] = snap.yf_industry
         enrich_entry(entry_dict)
         entries.append(entry_dict)
     return {

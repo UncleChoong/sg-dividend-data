@@ -16,10 +16,17 @@ class YahooQuote:
     market_cap: Optional[float]
     ttm_yield_pct: Optional[float]
     beta: Optional[float]
+    # Identity + descriptive metadata pulled from yfinance.info — used as a
+    # fallback when the ticker isn't in our hand-curated enrichment dict.
+    long_name: Optional[str] = None
+    yf_sector: Optional[str] = None
+    yf_industry: Optional[str] = None
+    long_business_summary: Optional[str] = None
 
 
 def fetch_quote(ticker: str) -> YahooQuote:
-    """Fetch price, market-cap, TTM yield and beta for an SGX ticker.
+    """Fetch price, market-cap, TTM yield, beta and descriptive metadata for
+    an SGX ticker.
 
     Args:
         ticker: bare SGX code, e.g. "D05".  The ".SI" suffix is added internally.
@@ -46,24 +53,48 @@ def fetch_quote(ticker: str) -> YahooQuote:
         except Exception:
             mcap = None
 
-        # TTM yield — try trailingAnnualDividendYield (fraction) then dividendYield (may be %)
-        # then fall back to computing from dividends series / price.
-        ttm_yield_pct: Optional[float] = _resolve_yield(t, price)
+        # All other metadata comes from the (slower) info dict. Pull it once.
+        info: dict = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
 
-        # beta — optional
+        ttm_yield_pct: Optional[float] = _resolve_yield(t, price, info)
+
         beta: Optional[float] = None
         try:
-            raw_beta = t.info.get("beta")
+            raw_beta = info.get("beta")
             if raw_beta is not None:
                 beta = float(raw_beta)
         except Exception:
             pass
+
+        long_name = info.get("longName") or info.get("shortName")
+        if isinstance(long_name, str):
+            long_name = long_name.strip() or None
+
+        yf_sector = info.get("sector")
+        if isinstance(yf_sector, str):
+            yf_sector = yf_sector.strip() or None
+
+        yf_industry = info.get("industry")
+        if isinstance(yf_industry, str):
+            yf_industry = yf_industry.strip() or None
+
+        summary = info.get("longBusinessSummary")
+        if isinstance(summary, str):
+            summary = summary.strip() or None
 
         return YahooQuote(
             price=float(price),
             market_cap=mcap,
             ttm_yield_pct=ttm_yield_pct,
             beta=beta,
+            long_name=long_name,
+            yf_sector=yf_sector,
+            yf_industry=yf_industry,
+            long_business_summary=summary,
         )
     except ValueError:
         raise
@@ -71,26 +102,24 @@ def fetch_quote(ticker: str) -> YahooQuote:
         raise ValueError(f"yfinance: failed to fetch {symbol}: {exc}") from exc
 
 
-def _resolve_yield(t: yf.Ticker, price: float) -> Optional[float]:
+def _resolve_yield(t: yf.Ticker, price: float, info: dict) -> Optional[float]:
     """Return TTM yield as a percentage (e.g. 5.0 for 5%), or None."""
     # 1. trailingAnnualDividendYield — Yahoo stores this as a fraction (0.05 = 5%)
     try:
-        info = t.info
         tay = info.get("trailingAnnualDividendYield")
         if tay and float(tay) > 0:
             pct = float(tay) * 100
             # Sanity check: yfinance occasionally stores it already as a percent
             if pct > 50:
-                pct = float(tay)  # it was already a percent
+                pct = float(tay)
             return round(pct, 4)
     except Exception:
         pass
 
-    # 2. dividendYield — Yahoo sometimes stores this already as a percent (e.g. 3.6 means 3.6%)
+    # 2. dividendYield — Yahoo sometimes stores this already as a percent
     try:
         dy = info.get("dividendYield")
         if dy and float(dy) > 0:
-            # If value > 1 it's already a percent; if <= 1 it's a fraction
             dy_f = float(dy)
             return round(dy_f if dy_f > 1 else dy_f * 100, 4)
     except Exception:

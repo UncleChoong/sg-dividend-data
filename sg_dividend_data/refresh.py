@@ -11,26 +11,30 @@ from sg_dividend_data.alerts import telegram_alert
 from sg_dividend_data.models import TickerSnapshot
 from sg_dividend_data.sources.dividend_history import fetch_div_history
 from sg_dividend_data.sources.yahoo import fetch_quote
-from sg_dividend_data.universe import SECTOR_MAP, SGX_DIVIDEND_TICKERS, lot_size_for
+from sg_dividend_data.universe import (
+    SGX_DIVIDEND_TICKERS,
+    classify_sector,
+    lot_size_for,
+)
 from sg_dividend_data.uploader import upload_to_r2
 from sg_dividend_data.writer import write_universe
 
 log = logging.getLogger("refresh")
 
 # Refuse to publish to R2 if fewer than this many tickers scraped successfully.
-# Protects against overwriting a good R2 file with a near-empty one when most
-# scrapers fail (e.g. during a network outage or anti-bot block wave).
 MIN_TICKERS_FOR_PUBLISH = 5
+
+# Minimum TTM yield (in %) for a ticker to count as "dividend-paying" and stay
+# in the published universe. Anything lower is either a junk feed or a stock
+# that has effectively stopped paying — out of scope for a dividend app.
+MIN_DIVIDEND_YIELD_PCT = 0.5
 
 
 def _compute_payout_ratio(history: list, snapshot=None) -> Optional[float]:
-    # MVP: we don't have EPS scraping yet; return None → scoring uses fallback.
-    # TODO(v2): pull EPS from Yahoo and compute payout = last_div / eps
     return None
 
 
 def _compute_price_vol_90d(ticker: str) -> Optional[float]:
-    # MVP: stub. TODO(v2): implement via Yahoo chart endpoint.
     return None
 
 
@@ -41,11 +45,15 @@ def build_snapshot(ticker: str) -> TickerSnapshot:
         hist = fetch_div_history(ticker)
     except Exception as e:
         log.warning("div history fetch failed for %s: %s (using empty history)", ticker, e)
-    name = ticker
+    # Prefer yfinance's longName when present, otherwise fall back to the ticker
+    # code (the writer/enrichment layer will override with curated names where
+    # available).
+    name = yq.long_name or ticker
+    sector = classify_sector(ticker, yq.yf_sector)
     return TickerSnapshot(
         ticker=ticker,
         name=name,
-        sector=SECTOR_MAP.get(ticker, "Other"),
+        sector=sector,
         price=yq.price,
         market_cap=yq.market_cap or 0.0,
         ttm_yield_pct=yq.ttm_yield_pct or 0.0,
@@ -53,23 +61,42 @@ def build_snapshot(ticker: str) -> TickerSnapshot:
         div_history_5y=hist,
         payout_ratio=_compute_payout_ratio(hist),
         price_vol_90d=_compute_price_vol_90d(ticker),
+        yf_long_name=yq.long_name,
+        yf_sector=yq.yf_sector,
+        yf_industry=yq.yf_industry,
+        yf_summary=yq.long_business_summary,
     )
 
 
 def refresh_all(*, dry_run: bool, output: Path) -> List[TickerSnapshot]:
     snapshots: list[TickerSnapshot] = []
     failures: list[str] = []
+    skipped_low_yield: list[str] = []
     for t in SGX_DIVIDEND_TICKERS:
         try:
             snap = build_snapshot(t)
+            if snap.ttm_yield_pct < MIN_DIVIDEND_YIELD_PCT:
+                skipped_low_yield.append(f"{t} ({snap.ttm_yield_pct:.2f}%)")
+                log.info(
+                    "skip %s — yield %.2f%% below %.2f%% cutoff",
+                    t, snap.ttm_yield_pct, MIN_DIVIDEND_YIELD_PCT,
+                )
+                continue
             snapshots.append(snap)
             log.info("ok %s price=%.2f yield=%.2f%%", t, snap.price, snap.ttm_yield_pct)
         except Exception as exc:
-            log.exception("fail %s: %s", t, exc)
+            log.warning("fail %s: %s", t, exc)
             failures.append(f"{t}: {exc}")
+    log.info(
+        "kept=%d failed=%d skipped_low_yield=%d",
+        len(snapshots), len(failures), len(skipped_low_yield),
+    )
     write_universe(snapshots, output)
-    if failures:
-        telegram_alert(f"SG dividend refresh: {len(failures)} failures\n" + "\n".join(failures[:20]))
+    if failures and not dry_run:
+        telegram_alert(
+            f"SG dividend refresh: {len(failures)} failures\n"
+            + "\n".join(failures[:20])
+        )
     if not dry_run:
         if len(snapshots) < MIN_TICKERS_FOR_PUBLISH:
             msg = (

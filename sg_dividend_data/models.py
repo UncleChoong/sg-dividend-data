@@ -14,6 +14,13 @@ class TickerSnapshot(BaseModel):
     div_history_5y: List[Optional[float]] = Field(default_factory=list)
     payout_ratio: Optional[float] = None
     price_vol_90d: Optional[float] = None
+    # Optional descriptive metadata captured from yfinance — passed through
+    # to enrichment so the consuming app gets a description even for tickers
+    # that aren't in our hand-curated map.
+    yf_long_name: Optional[str] = None
+    yf_sector: Optional[str] = None
+    yf_industry: Optional[str] = None
+    yf_summary: Optional[str] = None
 
 
 class ScoreBreakdown(BaseModel):
