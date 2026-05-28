@@ -130,60 +130,61 @@ def fetch_quote(ticker: str) -> YahooQuote:
         raise ValueError(f"yfinance: failed to fetch {symbol}: {exc}") from exc
 
 
-# Anything above this is almost certainly bad data — Yahoo's
-# trailingAnnualDividendYield / dividendYield fields occasionally return
-# values inflated by special / liquidation dividends, broken split
-# adjustments, or stale numerator-over-fresh-denominator bugs. SGX dividend
-# yields realistically top out around 12-15% even for the highest-yielders.
+import datetime
+
+# Yields above this cap are discarded as bad data — Singapore-listed
+# stocks realistically top out around 12-15%, so anything beyond is
+# either a broken yfinance feed or a one-off special dividend that will
+# mislead simulation users.
 MAX_PLAUSIBLE_YIELD_PCT = 20.0
 
 
-def _resolve_yield(t: yf.Ticker, price: float, info: dict) -> Optional[float]:
-    """Return TTM yield as a percentage (e.g. 5.0 for 5%), or None.
+def _fy_based_yield_pct(
+    t: yf.Ticker,
+    price: float,
+    *,
+    today: Optional[datetime.date] = None,
+) -> Optional[float]:
+    """Compute yield using the current-fiscal-year-first rule.
 
-    Order of preference, from most-reliable to least:
-      1. Sum of the last 12 months of dividends from `t.dividends` ÷ price.
-      2. trailingAnnualDividendYield from the info dict.
-      3. dividendYield from the info dict.
+    1. Sum of dividends paid in the current calendar year (FY) ÷ price.
+       If non-zero, that's the yield.
+    2. Otherwise, sum of dividends paid in the prior calendar year ÷ price.
+    3. Otherwise, return None — the caller drops the ticker.
 
-    Any candidate exceeding MAX_PLAUSIBLE_YIELD_PCT is discarded as bad
-    data — for example, C05 Chemical Industries shows 90% from Yahoo's
-    info dict despite the actual dividend history giving ~3%.
+    This matches the user-facing model: rank stocks by what they're
+    actually paying right now, falling back only when this year's payout
+    hasn't started. Eliminates two systemic problems:
+      - TTM yield is inflated when a recent special dividend lands.
+      - Multi-year-old payouts inflate the yield for zombie payers.
     """
-    # 1. Compute TTM yield from the actual dividend series — authoritative.
+    if price <= 0:
+        return None
+    today = today or datetime.date.today()
+    cy_current = today.year
+    cy_prior = cy_current - 1
     try:
         divs = t.dividends
-        if divs is not None and len(divs) > 0 and price > 0:
-            cutoff = pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=1)
-            ttm_total = float(divs[divs.index >= cutoff].sum())
-            if ttm_total > 0:
-                pct = ttm_total / price * 100
-                if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT:
-                    return round(pct, 4)
+        if divs is None or len(divs) == 0:
+            return None
+        # yfinance's dividend index is timezone-aware Timestamps; .year works.
+        years = divs.index.year
+        current_total = float(divs[years == cy_current].sum())
+        if current_total > 0:
+            pct = current_total / price * 100
+            return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
+        prior_total = float(divs[years == cy_prior].sum())
+        if prior_total > 0:
+            pct = prior_total / price * 100
+            return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
     except Exception:
         pass
-
-    # 2. trailingAnnualDividendYield — Yahoo stores this as a fraction (0.05 = 5%),
-    #    but occasionally as a raw percent. Treat anything > 1 as already-percent.
-    try:
-        tay = info.get("trailingAnnualDividendYield")
-        if tay and float(tay) > 0:
-            tay_f = float(tay)
-            pct = tay_f if tay_f > 1 else tay_f * 100
-            if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT:
-                return round(pct, 4)
-    except Exception:
-        pass
-
-    # 3. dividendYield — same fraction-vs-percent ambiguity as above.
-    try:
-        dy = info.get("dividendYield")
-        if dy and float(dy) > 0:
-            dy_f = float(dy)
-            pct = dy_f if dy_f > 1 else dy_f * 100
-            if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT:
-                return round(pct, 4)
-    except Exception:
-        pass
-
     return None
+
+
+def _resolve_yield(t: yf.Ticker, price: float, info: dict) -> Optional[float]:
+    """Compute the FY-based yield. The info-dict yield fields are no longer
+    consulted — they're the source of every C05-class bug we've fixed
+    (90% for a stock that pays ~3%, 15% for a stock that hasn't paid in
+    15 years). The dividend series is the authoritative record."""
+    return _fy_based_yield_pct(t, price)

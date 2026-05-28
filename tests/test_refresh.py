@@ -1,5 +1,5 @@
 import datetime
-from sg_dividend_data.refresh import _is_zombie_payer, build_snapshot
+from sg_dividend_data.refresh import build_snapshot
 from sg_dividend_data.models import TickerSnapshot
 from sg_dividend_data.sources.yahoo import YahooQuote
 
@@ -84,49 +84,7 @@ def test_refresh_drops_non_sgd_currency(monkeypatch, tmp_path):
     assert kept == {"D05"}, f"non-SGD tickers leaked through: {kept}"
 
 
-# ─── Zombie filter ────────────────────────────────────────────────────────
-def test_is_zombie_payer_drops_old_payments():
-    snap = _make_snapshot(last_dividend_date="2011-08-23")
-    assert _is_zombie_payer(snap) is True
-
-
-def test_is_zombie_payer_keeps_recent():
-    today = datetime.date.today().isoformat()
-    assert _is_zombie_payer(_make_snapshot(last_dividend_date=today)) is False
-
-
-def test_is_zombie_payer_keeps_unknown():
-    """No dividend date at all — treat as a brand-new listing, let it through.
-    The bundled history will be empty and the UI shows that gap."""
-    assert _is_zombie_payer(_make_snapshot(last_dividend_date=None)) is False
-
-
-def test_refresh_drops_zombie_payers(monkeypatch, tmp_path):
-    from sg_dividend_data import refresh as r
-
-    snapshots = {
-        "D05": _make_snapshot(
-            ticker="D05",
-            last_dividend_date=datetime.date.today().isoformat(),
-        ),
-        "AWK": _make_snapshot(
-            ticker="AWK",
-            ttm_yield_pct=15.0,  # Yahoo says it's high-yield...
-            last_dividend_date="2011-08-23",  # ...but last paid 2011
-        ),
-    }
-    monkeypatch.setattr(
-        r, "build_snapshot",
-        lambda t, **kw: snapshots[t],
-    )
-    monkeypatch.setattr(
-        r, "_build_candidate_universe",
-        lambda **kw: [(t, None) for t in snapshots],
-    )
-    monkeypatch.setattr(r, "upload_to_r2", lambda *a, **k: None)
-    monkeypatch.setattr(r, "telegram_alert", lambda *a, **k: True)
-
-    out = r.refresh_all(dry_run=True, output=tmp_path / "u.json")
-    kept = {s.ticker for s in out}
-    assert "AWK" not in kept, "zombie payer leaked through"
-    assert "D05" in kept
+# Zombie payers (AWK-style) are now filtered upstream in yahoo.py — see
+# tests/test_yahoo.py::test_fetch_quote_drops_zombie_via_yield_none. The
+# FY-based yield rule returns None when there are no FY25/FY26 dividends,
+# which becomes 0.0 in the snapshot and gets dropped by MIN_DIVIDEND_YIELD_PCT.

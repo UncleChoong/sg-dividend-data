@@ -28,9 +28,13 @@ log = logging.getLogger("refresh")
 # Refuse to publish to R2 if fewer than this many tickers scraped successfully.
 MIN_TICKERS_FOR_PUBLISH = 5
 
-# Minimum TTM yield (in %) for a ticker to count as "dividend-paying" and stay
-# in the published universe. Anything lower is either a junk feed or a stock
-# that has effectively stopped paying — out of scope for a dividend app.
+# Minimum FY-based yield (in %) for a ticker to count as "dividend-paying".
+# Yield is now computed from the current calendar year's dividends with a
+# fallback to the prior year (see sources/yahoo.py::_fy_based_yield_pct), so
+# anything below 0.5% is either a junk feed or has effectively stopped
+# paying — out of scope for a dividend app. Tickers with zero dividends in
+# both calendar years return None from _fy_based_yield_pct → zero ttm_yield
+# → filtered here. This replaces the prior date-based zombie filter.
 MIN_DIVIDEND_YIELD_PCT = 0.5
 
 # Currencies accepted in the published universe. SGX-listed names that trade
@@ -38,12 +42,6 @@ MIN_DIVIDEND_YIELD_PCT = 0.5
 # Q5T, Elite UK MENU, etc.) get filtered out — displaying their USD prices
 # with an "S$" prefix would mislead users running dividend simulations.
 ACCEPTED_CURRENCIES = {"SGD", None}
-
-# Tickers with no dividend payment in the last N days are filtered out.
-# Catches zombie payers — companies that yfinance still reports a
-# dividendYield for despite having actually stopped paying years ago
-# (e.g. AWK Fuxing China Group last paid in 2011).
-MAX_DAYS_SINCE_LAST_DIVIDEND = 730  # 2 years
 
 
 def _compute_payout_ratio(history: list, snapshot=None) -> Optional[float]:
@@ -92,27 +90,6 @@ def build_snapshot(ticker: str, *, sgx_sector_hint: Optional[str] = None) -> Tic
     )
 
 
-def _is_zombie_payer(snap: TickerSnapshot) -> bool:
-    """True if the most-recent dividend payment is older than the cutoff.
-
-    Catches AWK-style entries where Yahoo still reports a dividendYield
-    but the underlying company stopped paying years ago.
-    """
-    import datetime
-    if not snap.last_dividend_date:
-        # No dividend history at all — yield can only come from Yahoo's
-        # info fields which we've already learned are unreliable for
-        # zombie payers. Treat as zombie unless yfinance gave us a
-        # current yield AND the ticker has zero recorded payments
-        # (likely a new listing — let it through, the bundled history
-        # will simply be empty and the user sees that).
-        return False
-    try:
-        last = datetime.date.fromisoformat(snap.last_dividend_date)
-        age_days = (datetime.date.today() - last).days
-        return age_days > MAX_DAYS_SINCE_LAST_DIVIDEND
-    except Exception:
-        return False
 
 
 def _explicit_sector_overrides() -> set[str]:
@@ -175,7 +152,6 @@ def refresh_all(
     failures: list[str] = []
     skipped_low_yield: list[str] = []
     skipped_currency: list[str] = []
-    skipped_zombie: list[str] = []
     candidates = _build_candidate_universe(auto_discover=auto_discover)
     for t, hint in candidates:
         try:
@@ -183,11 +159,10 @@ def refresh_all(
             if snap.currency not in ACCEPTED_CURRENCIES:
                 skipped_currency.append(f"{t} ({snap.currency})")
                 continue
+            # FY-based yield: 0 means no dividends paid in either the
+            # current or prior calendar year — exclude.
             if snap.ttm_yield_pct < MIN_DIVIDEND_YIELD_PCT:
                 skipped_low_yield.append(f"{t} ({snap.ttm_yield_pct:.2f}%)")
-                continue
-            if _is_zombie_payer(snap):
-                skipped_zombie.append(f"{t} (last_div={snap.last_dividend_date})")
                 continue
             snapshots.append(snap)
             log.info(
@@ -198,14 +173,12 @@ def refresh_all(
             log.warning("fail %s: %s", t, exc)
             failures.append(f"{t}: {exc}")
     log.info(
-        "kept=%d failed=%d skipped_low_yield=%d skipped_currency=%d skipped_zombie=%d",
+        "kept=%d failed=%d skipped_low_yield_or_no_fy_divs=%d skipped_currency=%d",
         len(snapshots), len(failures), len(skipped_low_yield),
-        len(skipped_currency), len(skipped_zombie),
+        len(skipped_currency),
     )
     if skipped_currency:
         log.info("non-SGD tickers filtered: %s", ", ".join(skipped_currency[:20]))
-    if skipped_zombie:
-        log.info("zombie payers filtered: %s", ", ".join(skipped_zombie[:20]))
     write_universe(snapshots, output)
     if failures and not dry_run:
         telegram_alert(
