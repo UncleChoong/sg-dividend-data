@@ -132,11 +132,13 @@ def fetch_quote(ticker: str) -> YahooQuote:
 
 import datetime
 
-# Yields above this cap are discarded as bad data — Singapore-listed
-# stocks realistically top out around 12-15%, so anything beyond is
-# either a broken yfinance feed or a one-off special dividend that will
-# mislead simulation users.
-MAX_PLAUSIBLE_YIELD_PCT = 20.0
+# Yields above this cap are discarded as bad data, or as
+# distressed-payer signals that don't belong in a dividend simulator
+# targeted at retail income investors. SGX REITs realistically max out
+# around 10-12% even for the highest-yielders; anything above is
+# almost always a small-cap with a depressed share price where the
+# dividend is being priced in for a cut.
+MAX_PLAUSIBLE_YIELD_PCT = 12.0
 
 
 def _fy_based_yield_pct(
@@ -204,6 +206,32 @@ def _fy_based_yield_pct(
             # Zero completed years had dividends but FY-current has → use
             # what they've paid so far as the best available estimate.
             avg_div = cur_paid
+
+        # Three conservative floors that together prevent the average from
+        # showing rosier numbers than what the company is actually paying
+        # right now. We take the minimum of:
+        #
+        #   1. 3-year average (default)
+        #   2. FY-1 total — catches 2024-style one-off specials where a
+        #      single big year pulls the average up despite a return to
+        #      normal payment levels (BEI/LHT Holdings: 2024 $0.18 surge,
+        #      2023 + 2025 both $0.05).
+        #   3. TTM total — catches gradual per-payment cuts where the
+        #      calendar-year totals look stable but each individual
+        #      payment is shrinking (HLS Helens: $0.028 → $0.020 → $0.019
+        #      → $0.010 over four payments).
+        #
+        # The minimum is the most conservative defensible estimate for a
+        # dividend simulator targeting realistic income projections.
+        if prior_paid > 0 and prior_paid < avg_div:
+            avg_div = prior_paid
+
+        idx = divs.index
+        today_ts = pd.Timestamp(today, tz="UTC")
+        cutoff = today_ts - pd.DateOffset(years=1)
+        ttm_total = float(divs[(idx >= cutoff) & (idx <= today_ts)].sum())
+        if ttm_total > 0 and ttm_total < avg_div:
+            avg_div = ttm_total
 
         pct = avg_div / price * 100
         return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None

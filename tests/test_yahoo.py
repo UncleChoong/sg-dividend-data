@@ -52,11 +52,8 @@ def _div_series(*dated_amounts: tuple[str, float]) -> pd.Series:
 # ─── 3-year average yield rule ────────────────────────────────────────────
 def test_three_year_average_basic():
     """Aztech-style: 3 completed years with growing dividends.
-    Avg of $0.045 + $0.10 + $0.11 = $0.085, on $0.945 → 9.0%.
-
-    This is the canonical user-driven case: a high-payout-ratio stock
-    whose TTM yield (12.8%) overstates the run rate. The smoothed average
-    shows the trend without the peak."""
+    3-yr avg = $0.085, FY-1 = $0.11, TTM = $0.12 — min is the avg.
+    On $0.945 → 9.0%."""
     t = MagicMock()
     t.dividends = _div_series(
         ("2023-05-05", 0.015),
@@ -69,8 +66,27 @@ def test_three_year_average_basic():
     )
     today = datetime.date(2026, 5, 28)
     pct = _fy_based_yield_pct(t, price=0.945, today=today)
-    # (0.045 + 0.10 + 0.11) / 3 = 0.085; 0.085 / 0.945 ≈ 9.0%
+    # min(3-yr avg=0.085, FY-1=0.11, TTM=0.12) = 0.085 → 9.0%.
     assert pct == pytest.approx(9.0, abs=0.1)
+
+
+def test_fy_prior_floor_catches_one_off_specials():
+    """BEI/LHT Holdings: 2024 had a one-off $0.18 special, 2023 + 2025
+    both back to $0.05 normal. 3-yr avg = $0.093 (skewed by special) but
+    FY-1 ($0.05) is the actual current rate. Floor brings us down to FY-1."""
+    t = MagicMock()
+    t.dividends = _div_series(
+        ("2023-04-15", 0.05),
+        ("2024-04-15", 0.18),  # one-off
+        ("2025-04-15", 0.05),
+    )
+    today = datetime.date(2026, 5, 28)
+    pct = _fy_based_yield_pct(t, price=0.815, today=today)
+    # 3-yr avg = (0.05 + 0.18 + 0.05)/3 = $0.093
+    # FY-1 = $0.05; FY-1 floor applies → avg_div = $0.05
+    # TTM (last 365d from 2026-05-28): includes 2025-04-15 ($0.05) → $0.05
+    # min = $0.05 → 0.05/0.815 ≈ 6.13%.
+    assert pct == pytest.approx(6.13, abs=0.2)
 
 
 def test_three_year_average_smooths_special_dividends():
@@ -174,7 +190,7 @@ def test_new_ipo_only_paid_in_current_fy():
 
 
 def test_caps_implausible_yields():
-    """A 25%+ averaged yield is bad data → return None."""
+    """Anything above 12% — distressed-payer territory — is excluded."""
     t = MagicMock()
     t.dividends = _div_series(
         ("2023-04-15", 5.00),
@@ -183,8 +199,45 @@ def test_caps_implausible_yields():
         ("2026-04-15", 5.00),
     )
     today = datetime.date(2026, 5, 28)
-    # 5.0 average on $10 → 50%, well above 20% cap.
+    # 5.0 average on $10 → 50%, well above 12% cap.
     assert _fy_based_yield_pct(t, price=10.0, today=today) is None
+
+
+def test_caps_excludes_distressed_small_caps():
+    """HLS-style distressed payer: depressed price + recent cuts → 19%+
+    historical-average yield. Above the 12% cap → dropped."""
+    t = MagicMock()
+    t.dividends = _div_series(
+        ("2024-09-11", 0.028),
+        ("2025-05-16", 0.020),
+        ("2025-09-16", 0.019),
+        ("2026-05-18", 0.010),
+    )
+    today = datetime.date(2026, 5, 28)
+    pct = _fy_based_yield_pct(t, price=0.17, today=today)
+    # Without the cap: 3-yr avg = (0.028 + 0.039) / 2 = $0.0335 → 19.7%.
+    # With TTM floor: TTM = $0.0291 → 17.1%. Still > 12% cap → None.
+    assert pct is None
+
+
+def test_ttm_floor_catches_recent_cuts_below_cap():
+    """A dividend-cutter whose TTM is below the 3-year average but still
+    under the cap should display the TTM-based number, not the average."""
+    t = MagicMock()
+    t.dividends = _div_series(
+        # 2023: $0.50 paid, $0.50 yield on $100 = nope, on $10:
+        ("2023-06-15", 0.50),
+        ("2024-06-15", 0.40),  # 20% cut
+        ("2025-06-15", 0.30),  # another 25% cut
+        ("2026-06-15", 0.10),  # major cut — but in this test the date
+                               # is past today so won't count for TTM
+    )
+    today = datetime.date(2026, 7, 1)  # after the 2026 payment
+    pct = _fy_based_yield_pct(t, price=10.0, today=today)
+    # 3-year avg (CY23+24+25): (0.50 + 0.40 + 0.30) / 3 = $0.40 → 4.0%
+    # TTM (last 12 months from 2026-07-01): only the 2026-06-15 $0.10 → 1.0%
+    # TTM is lower → display TTM. Yield = 1.0%.
+    assert pct == pytest.approx(1.0, abs=0.05)
 
 
 def test_handles_zero_price():
@@ -195,7 +248,9 @@ def test_handles_zero_price():
 
 def test_ignores_yahoo_info_dict():
     """Yahoo's info.dividendYield is bogus for C05-style cases — the new
-    rule must NOT consult it at all."""
+    rule must NOT consult it at all. The TTM floor also kicks in here
+    because 2025's $0.005 was paid before the TTM window, leaving only
+    the 2026-04-15 $0.005 in TTM → that's the lower-of-two and wins."""
     fake = _make_fake_ticker(
         last_price=0.55,
         trailing_yield=0.90,  # bogus 90%
@@ -207,11 +262,11 @@ def test_ignores_yahoo_info_dict():
     )
     with patch("sg_dividend_data.sources.yahoo.yf.Ticker", return_value=fake):
         q = fetch_quote("C05")
-    # 3-year avg: only 2024 ($0.015) and 2025 ($0.005) have non-zero in
-    # completed years (2023 = 0). Avg of non-zero years = (0.015 + 0.005)/2 = 0.01.
-    # 0.01 / 0.55 ≈ 1.8%
+    # 3-yr avg of non-zero = (0.015 + 0.005)/2 = 0.01.
+    # TTM (from 2025-05-28 cutoff) = just 2026-04-15 $0.005.
+    # min = 0.005 → 0.005/0.55 ≈ 0.91%.
     assert q.ttm_yield_pct is not None
-    assert abs(q.ttm_yield_pct - 1.8) < 0.5
+    assert abs(q.ttm_yield_pct - 0.91) < 0.1
 
 
 # ─── fetch_quote integration ──────────────────────────────────────────────
