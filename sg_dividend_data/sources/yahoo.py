@@ -145,33 +145,33 @@ def _fy_based_yield_pct(
     *,
     today: Optional[datetime.date] = None,
 ) -> Optional[float]:
-    """Annualised current-FY yield with prior-year cadence scaling.
+    """Headline yield = average of the last 3 completed calendar years'
+    dividends ÷ current price.
 
-    Rule:
-      A. If dividends paid in the current calendar year > 0:
-         Scale that partial-year sum to a full-year estimate using FY-1's
-         payment cadence:
+    Why a 3-year average rather than TTM or partial-FY annualisation:
+      - TTM yield over-weights special / one-off dividends (TCU's $0.09
+        May 2026 special projected forward to ~20%).
+      - High-payout small-caps whose price has declined (Aztech 76.9%
+        payout ratio, stock down from S$1.28 IPO to S$0.945) display
+        "yield" numbers that are mathematically real but unsustainable
+        — the smoothing surfaces the trend, not the peak.
+      - A multi-year average naturally signals dividend stability: a
+        cut a few years ago drags the average down for a while.
 
-             annualised = FY_current_paid * (FY_prior_full / FY_prior_paid_by_same_date)
+    Eligibility rule (user-specified): the ticker must have paid at
+    least one dividend in either the current calendar year or the
+    immediately prior calendar year. Anything older is treated as a
+    zombie payer and dropped (returns None).
 
-         If FY-1 had a payment by the same calendar date this year does,
-         the scale factor reflects the actual cadence (1.0 for full payers,
-         4.0 for quarterly with one payment in, 2.0 for semi-annual, etc.).
-         If FY-1 had no payment by the same date but had a full-year sum,
-         we fall through to case B rather than try to extrapolate blindly.
+    Falls back gracefully:
+      - 3 completed years had payments  → average of all 3.
+      - Fewer completed years have payments (newer listings) → average
+        over only those years.
+      - Zero completed years had payments but current FY has → use the
+        current-FY partial as-is (brand-new IPO best-effort).
+      - Nothing → return None, caller drops the ticker.
 
-      B. Else if FY-1 total > 0:
-         annualised = FY_prior_total (last full year is the benchmark).
-
-      C. Else return None — the caller drops the ticker.
-
-    Any candidate exceeding MAX_PLAUSIBLE_YIELD_PCT is discarded.
-
-    This eliminates two systemic problems:
-      - TTM yield inflated by recent special dividends (e.g. TCU's
-        partial-year special is no longer projected as a full-year rate).
-      - Stocks like DBS appearing to have cut their yield in half just
-        because we're mid-year and only one quarter has paid out.
+    A hard cap of MAX_PLAUSIBLE_YIELD_PCT discards bad-data outliers.
     """
     if price <= 0:
         return None
@@ -182,52 +182,31 @@ def _fy_based_yield_pct(
         divs = t.dividends
         if divs is None or len(divs) == 0:
             return None
-        # yfinance's dividend index is tz-aware Timestamps; .year / .month / .day work.
-        idx = divs.index
-        years = idx.year
+        years = divs.index.year
         cur_paid = float(divs[years == cy_current].sum())
-        prior_total = float(divs[years == cy_prior].sum())
+        prior_paid = float(divs[years == cy_prior].sum())
 
-        if cur_paid > 0:
-            # FY-1 dividends paid by the same month/day as today, last year.
-            prior_by_today = float(divs[
-                (years == cy_prior)
-                & (
-                    (idx.month < today.month)
-                    | ((idx.month == today.month) & (idx.day <= today.day))
-                )
-            ].sum())
-            if prior_by_today > 0 and prior_total > 0:
-                # Run-rate scale: how much MORE did FY-1 pay after this date?
-                scale = prior_total / prior_by_today
-                # Sanity-cap the multiplier. A scale > 5 would imply the
-                # current FY's only payment is a tiny interim and the bulk
-                # comes much later — better to fall through to FY-1 total
-                # than over-project.
-                if scale > 5.0:
-                    annualised = prior_total
-                else:
-                    annualised = cur_paid * scale
-            else:
-                # No FY-1 payment by the same date → don't extrapolate from a
-                # zero baseline. Use FY-1 total if available, else FY-current paid as-is.
-                annualised = prior_total if prior_total > 0 else cur_paid
+        # Eligibility — must have paid this year or last.
+        if cur_paid <= 0 and prior_paid <= 0:
+            return None
 
-            # Growth-rate ceiling: dividends rarely grow >50% YoY. If our
-            # extrapolation implies that, the FY-current "paid so far" almost
-            # certainly contains a one-off / special dividend (TCU's $0.09
-            # extraordinary payout in May 2026 is the canonical case) and
-            # annualising it would mislead simulation users. Fall back to
-            # FY-1 total as a more sustainable estimate.
-            if prior_total > 0 and annualised > 1.5 * prior_total:
-                annualised = prior_total
+        # Sum of dividends per completed year for the last 3 years.
+        completed_totals: list[float] = []
+        for offset in range(1, 4):
+            cy = cy_current - offset
+            total = float(divs[years == cy].sum())
+            completed_totals.append(total)
+        non_zero = [v for v in completed_totals if v > 0]
 
-            pct = annualised / price * 100
-            return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
+        if non_zero:
+            avg_div = sum(non_zero) / len(non_zero)
+        else:
+            # Zero completed years had dividends but FY-current has → use
+            # what they've paid so far as the best available estimate.
+            avg_div = cur_paid
 
-        if prior_total > 0:
-            pct = prior_total / price * 100
-            return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
+        pct = avg_div / price * 100
+        return round(pct, 4) if 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT else None
     except Exception:
         pass
     return None
