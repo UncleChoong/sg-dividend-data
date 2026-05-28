@@ -10,6 +10,10 @@ from typing import List, Optional
 from sg_dividend_data.alerts import telegram_alert
 from sg_dividend_data.models import TickerSnapshot
 from sg_dividend_data.sources.dividend_history import fetch_div_history
+from sg_dividend_data.sources.sgx_master import (
+    fetch_sgx_master,
+    sgx_type_to_sector,
+)
 from sg_dividend_data.sources.yahoo import fetch_quote
 from sg_dividend_data.universe import (
     SGX_DIVIDEND_TICKERS,
@@ -38,18 +42,24 @@ def _compute_price_vol_90d(ticker: str) -> Optional[float]:
     return None
 
 
-def build_snapshot(ticker: str) -> TickerSnapshot:
+def build_snapshot(ticker: str, *, sgx_sector_hint: Optional[str] = None) -> TickerSnapshot:
+    """Build a TickerSnapshot from yfinance + optional SGX-type hint.
+
+    `sgx_sector_hint`, when provided, takes precedence over yfinance's GICS
+    sector — used by the auto-discover path so SGX's authoritative REIT /
+    Business Trust classification is honoured.
+    """
     yq = fetch_quote(ticker)
     hist: list = []
     try:
         hist = fetch_div_history(ticker)
     except Exception as e:
         log.warning("div history fetch failed for %s: %s (using empty history)", ticker, e)
-    # Prefer yfinance's longName when present, otherwise fall back to the ticker
-    # code (the writer/enrichment layer will override with curated names where
-    # available).
     name = yq.long_name or ticker
+    # Sector precedence: hardcoded SECTOR_MAP > SGX type hint > yfinance sector heuristic.
     sector = classify_sector(ticker, yq.yf_sector)
+    if sgx_sector_hint and ticker not in _explicit_sector_overrides():
+        sector = sgx_sector_hint
     return TickerSnapshot(
         ticker=ticker,
         name=name,
@@ -68,19 +78,71 @@ def build_snapshot(ticker: str) -> TickerSnapshot:
     )
 
 
-def refresh_all(*, dry_run: bool, output: Path) -> List[TickerSnapshot]:
+def _explicit_sector_overrides() -> set[str]:
+    """Tickers where our hand-curated SECTOR_MAP wins over the SGX type hint.
+    Returns the set of tickers explicitly mapped in universe.SECTOR_MAP.
+    """
+    from sg_dividend_data.universe import SECTOR_MAP
+    return set(SECTOR_MAP.keys())
+
+
+def _build_candidate_universe(*, auto_discover: bool) -> list[tuple[str, Optional[str]]]:
+    """Return [(ticker, sgx_sector_hint), ...] to feed the refresh loop.
+
+    With auto_discover=True, unions curated + SGX-master tickers and tags
+    each with the SGX-type-derived sector hint (REITs / ETFs / Business
+    Trusts) where applicable.
+    """
+    if not auto_discover:
+        return [(t, None) for t in SGX_DIVIDEND_TICKERS]
+
+    sgx_secs = fetch_sgx_master()
+    if not sgx_secs:
+        log.warning(
+            "sgx_master returned 0 securities — falling back to curated list only"
+        )
+        return [(t, None) for t in SGX_DIVIDEND_TICKERS]
+
+    sgx_hints: dict[str, Optional[str]] = {
+        s.ticker: sgx_type_to_sector(s.sgx_type) for s in sgx_secs
+    }
+    out: list[tuple[str, Optional[str]]] = []
+    seen: set[str] = set()
+    # Curated tickers first so they're preferred for ordering.
+    for t in SGX_DIVIDEND_TICKERS:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append((t, sgx_hints.get(t)))
+    for t, hint in sgx_hints.items():
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append((t, hint))
+    log.info(
+        "candidate universe: curated=%d discovered=%d total=%d",
+        len(SGX_DIVIDEND_TICKERS),
+        len(sgx_hints),
+        len(out),
+    )
+    return out
+
+
+def refresh_all(
+    *,
+    dry_run: bool,
+    output: Path,
+    auto_discover: bool = False,
+) -> List[TickerSnapshot]:
     snapshots: list[TickerSnapshot] = []
     failures: list[str] = []
     skipped_low_yield: list[str] = []
-    for t in SGX_DIVIDEND_TICKERS:
+    candidates = _build_candidate_universe(auto_discover=auto_discover)
+    for t, hint in candidates:
         try:
-            snap = build_snapshot(t)
+            snap = build_snapshot(t, sgx_sector_hint=hint)
             if snap.ttm_yield_pct < MIN_DIVIDEND_YIELD_PCT:
                 skipped_low_yield.append(f"{t} ({snap.ttm_yield_pct:.2f}%)")
-                log.info(
-                    "skip %s — yield %.2f%% below %.2f%% cutoff",
-                    t, snap.ttm_yield_pct, MIN_DIVIDEND_YIELD_PCT,
-                )
                 continue
             snapshots.append(snap)
             log.info("ok %s price=%.2f yield=%.2f%%", t, snap.price, snap.ttm_yield_pct)
@@ -116,9 +178,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--dry-run", action="store_true", help="write JSON locally, do not upload")
     p.add_argument("--output", default="sg_dividend_universe.json")
+    p.add_argument(
+        "--auto-discover",
+        action="store_true",
+        help="Union curated list with the live SGX master from api.sgx.com",
+    )
     args = p.parse_args(argv)
     try:
-        snaps = refresh_all(dry_run=args.dry_run, output=Path(args.output))
+        snaps = refresh_all(
+            dry_run=args.dry_run,
+            output=Path(args.output),
+            auto_discover=args.auto_discover,
+        )
         log.info("refresh complete: %d tickers", len(snaps))
         return 0
     except Exception:
